@@ -1,0 +1,4 @@
+flask>=3.0
+requests>=2.31
+gunicorn>=21.2
+# curl_cffi>=0.7     # 可选：遇到 Cloudflare 拦截时安装，提供 TLS 指纹伪装

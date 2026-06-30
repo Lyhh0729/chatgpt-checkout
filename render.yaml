@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: chatgpt-checkout
+    env: python
+    region: oregon          # 美国俄勒冈（可直连 chatgpt.com）
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # --- 代理配置（可选）---
+      # 如果 Render 直连 chatgpt.com 不通，在此填写代理地址：
+      # - key: HTTPS_PROXY
+      #   value: "http://your-proxy:8080"
+      # --- TLS 指纹伪装（可选）---
+      # 如果遇到 Cloudflare 拦截，取消下面注释启用 curl_cffi：
+      # - key: USE_CURL_CFFI
+      #   value: "1"
