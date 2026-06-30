@@ -28,8 +28,11 @@ import requests
 # --- 配置 ---
 OPENAI_BASE = "https://chatgpt.com"
 CHECKOUT_URL = f"{OPENAI_BASE}/backend-api/payments/checkout"
-ACCOUNT_URL = f"{OPENAI_BASE}/backend-api/me"
-SESSION_URL = f"{OPENAI_BASE}/api/auth/session"
+# 订阅查询依次尝试的端点
+ACCOUNT_CHECK_URLS = [
+    f"{OPENAI_BASE}/backend-api/accounts/check",   # 最可能返回 accounts.default
+    f"{OPENAI_BASE}/api/auth/session",              # 备选：session 信息
+]
 
 REGION_PRESETS = {
     "PH": {"country": "PH", "currency": "PHP"},
@@ -101,7 +104,7 @@ def _get_session():
     # 标准 requests Session
     session = requests.Session()
 
-    # Chrome 131 标准 Headers
+    # Chrome 131 标准 Headers（不设 Accept-Encoding，让 requests 自动处理解压）
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -110,7 +113,6 @@ def _get_session():
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control": "no-cache",
         "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "Sec-Ch-Ua-Mobile": "?0",
@@ -141,13 +143,12 @@ def _openai_api_headers(access_token: str) -> dict:
 
 def _safe_requests(method: str, url: str, access_token: str, json_body: dict = None) -> tuple:
     """
-    安全地向 OpenAI API 发送请求（带代理、重试、错误处理）
+    安全地向 OpenAI API 发送请求
     返回 (ok: bool, result: dict, status_code: int)
     """
     session = _get_session()
     headers = _openai_api_headers(access_token)
 
-    # 最多重试 2 次（应对间歇性 Cloudflare 拦截）
     for attempt in range(3):
         try:
             if method.upper() == "GET":
@@ -157,18 +158,27 @@ def _safe_requests(method: str, url: str, access_token: str, json_body: dict = N
 
             logger.info(f"OpenAI {method} {url} → {resp.status_code} (attempt {attempt + 1})")
 
-            # Cloudflare 拦截时返回 403 + text/html
-            if resp.status_code == 403 and "text/html" in resp.headers.get("Content-Type", ""):
+            # Cloudflare 拦截：403 + HTML
+            ct = resp.headers.get("Content-Type", "")
+            if resp.status_code == 403 and "text/html" in ct:
                 logger.warning(f"疑似 Cloudflare 拦截 (403 HTML), attempt {attempt + 1}")
                 if attempt < 2:
                     import time
                     time.sleep(1.5)
-                    continue  # 重试
+                    continue
 
+            # 尝试解析 JSON
             try:
                 body = resp.json()
             except Exception:
-                body = {"_raw": resp.text[:2000], "_status": resp.status_code}
+                # 非 JSON 响应：根据 Content-Type 处理
+                if "text/html" in ct:
+                    body = {"error": f"OpenAI 返回了 HTML 页面 (状态码 {resp.status_code})，可能被 Cloudflare 拦截或端点不存在"}
+                elif "text/plain" in ct:
+                    body = {"error": resp.text[:500]}
+                else:
+                    # 二进制或其他格式，不暴露原始数据
+                    body = {"error": f"OpenAI 返回了非 JSON 响应 (Content-Type: {ct}, 状态码: {resp.status_code})，该端点可能不可用"}
 
             if resp.ok:
                 return True, body, resp.status_code
@@ -177,7 +187,7 @@ def _safe_requests(method: str, url: str, access_token: str, json_body: dict = N
 
         except requests.exceptions.Timeout:
             if attempt < 2:
-                logger.warning(f"请求超时，重试中... (attempt {attempt + 1})")
+                logger.warning(f"请求超时，重试... (attempt {attempt + 1})")
                 import time
                 time.sleep(1)
                 continue
@@ -185,11 +195,11 @@ def _safe_requests(method: str, url: str, access_token: str, json_body: dict = N
 
         except requests.exceptions.ConnectionError as e:
             if attempt < 2:
-                logger.warning(f"连接失败，重试中... (attempt {attempt + 1})")
+                logger.warning(f"连接失败，重试... (attempt {attempt + 1})")
                 import time
                 time.sleep(1)
                 continue
-            return False, {"error": f"无法连接 OpenAI，请检查网络/代理: {str(e)[:200]}"}, 502
+            return False, {"error": f"无法连接 OpenAI: {str(e)[:200]}"}, 502
 
         except Exception as exc:
             logger.exception("请求 OpenAI 异常")
@@ -295,21 +305,28 @@ def api_check():
 
     logger.info("查询订阅来源")
 
-    ok, body, status = _safe_requests("GET", ACCOUNT_URL, access_token)
-    if ok and body.get("accounts"):
-        return jsonify({"ok": True, **body})
+    last_error = None
+    for url in ACCOUNT_CHECK_URLS:
+        logger.info(f"尝试: {url}")
+        ok, body, status = _safe_requests("GET", url, access_token)
+        if ok and body.get("accounts"):
+            return jsonify({"ok": True, **body})
+        if ok and body.get("user"):
+            # /api/auth/session 返回用户信息，包装成兼容格式
+            return jsonify({"ok": True, **body})
+        if not ok:
+            last_error = body
 
-    logger.info("/backend-api/me 失败，回退到 /api/auth/session")
-    ok2, body2, _ = _safe_requests("GET", SESSION_URL, access_token)
-    if ok2:
-        return jsonify({"ok": True, **body2})
-
+    # 全部失败
     error_msg = (
-        body.get("error", {}).get("detail")
-        or body.get("error", {}).get("message")
-        or str(body)[:500]
+        last_error.get("error", {}).get("detail")
+        or last_error.get("error", {}).get("message")
+        or last_error.get("error")
+        or "所有查询端点均失败，请检查 Token 是否有效"
+        if isinstance(last_error, dict)
+        else str(last_error)[:300]
     )
-    return jsonify({"ok": False, "error": str(error_msg), "raw": body}), status
+    return jsonify({"ok": False, "error": str(error_msg)}), 502
 
 
 # ======================== API：健康检查 + 连通性测试 ========================
